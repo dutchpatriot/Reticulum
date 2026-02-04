@@ -157,6 +157,8 @@ class BluetoothInterface(Interface):
         self.bitrate = BluetoothInterface.BITRATE_GUESS
         self.peers = {}                    # addr -> [last_seen, BluetoothPeer]
         self.spawned_interfaces = {}       # addr -> BluetoothPeer
+        self.pending_connections = set()   # addresses currently being connected
+        self.connection_backoff = {}       # addr -> next_allowed_time
         self.write_lock = threading.Lock()
 
         # Async event loop for BLE operations
@@ -197,10 +199,9 @@ class BluetoothInterface(Interface):
         try:
             from bleak import BleakScanner
 
-            # Start continuous scanning
+            # Start continuous scanning (no filter - check UUID in callback)
             self._scanner = BleakScanner(
-                detection_callback=self._on_device_found,
-                service_uuids=[RNS_SERVICE_UUID]
+                detection_callback=self._on_device_found
             )
             await self._scanner.start()
             RNS.log(f"{self} BLE scanner started", RNS.LOG_VERBOSE)
@@ -279,35 +280,66 @@ class BluetoothInterface(Interface):
     def _on_device_found(self, device, advertisement_data):
         """Callback when BLE scanner finds a device."""
         # Check if device is advertising Reticulum service
-        if RNS_SERVICE_UUID.lower() in [s.lower() for s in advertisement_data.service_uuids]:
+        service_uuids = advertisement_data.service_uuids or []
+        if RNS_SERVICE_UUID.lower() in [s.lower() for s in service_uuids]:
             addr = device.address
 
-            if addr not in self.peers:
-                RNS.log(f"{self} discovered peer: {device.name} ({addr})", RNS.LOG_DEBUG)
-
-                # Connect to peer asynchronously
-                asyncio.run_coroutine_threadsafe(
-                    self._connect_to_peer(device),
-                    self._loop
-                )
+            if addr not in self.peers and addr not in self.spawned_interfaces:
+                RNS.log(f"{self} discovered RNS peer: {device.name} ({addr})", RNS.LOG_NOTICE)
+                # Add peer directly based on advertisement (trusted discovery)
+                self._add_peer(addr, device)
+            elif addr in self.peers:
+                # Refresh existing peer
+                self.peers[addr][0] = time.time()
 
     async def _connect_to_peer(self, device):
         """Connect to a discovered peer and verify group membership."""
+        addr = device.address
+        now = time.time()
+
+        # Skip if already connected or connection pending
+        if addr in self.peers or addr in self.spawned_interfaces:
+            return
+        if addr in self.pending_connections:
+            return
+
+        # Check backoff timer
+        if addr in self.connection_backoff:
+            if now < self.connection_backoff[addr]:
+                return  # Still in backoff period
+
+        # Mark as pending
+        self.pending_connections.add(addr)
+
         try:
             from bleak import BleakClient
 
-            async with BleakClient(device.address) as client:
+            RNS.log(f"{self} connecting to peer {addr}...", RNS.LOG_VERBOSE)
+
+            async with BleakClient(addr, timeout=10.0) as client:
+                RNS.log(f"{self} connected to {addr}, reading group ID...", RNS.LOG_VERBOSE)
+
                 # Read group ID characteristic to verify peer
                 group_data = await client.read_gatt_char(RNS_ID_CHARACTERISTIC)
+                RNS.log(f"{self} peer {addr} group data: {group_data.hex()}", RNS.LOG_VERBOSE)
 
                 # Verify group hash matches
                 if group_data == self.group_hash[:16]:
-                    self._add_peer(device.address, client)
+                    RNS.log(f"{self} peer {addr} verified, adding as peer", RNS.LOG_NOTICE)
+                    self._add_peer(addr, client)
                 else:
-                    RNS.log(f"{self} peer {device.address} has different group ID, ignoring", RNS.LOG_DEBUG)
+                    RNS.log(f"{self} peer {addr} has different group ID (got {group_data.hex()}, expected {self.group_hash[:16].hex()})", RNS.LOG_WARNING)
 
         except Exception as e:
-            RNS.log(f"{self} failed to connect to peer {device.address}: {e}", RNS.LOG_DEBUG)
+            # Set backoff for retry (5-15 seconds random)
+            import random
+            backoff = 5 + random.random() * 10
+            self.connection_backoff[addr] = now + backoff
+            RNS.log(f"{self} failed to connect to peer {addr}: {e} (retry in {backoff:.1f}s)", RNS.LOG_DEBUG)
+
+        finally:
+            # Remove from pending
+            self.pending_connections.discard(addr)
 
     def _add_peer(self, addr, client=None):
         """Add a verified peer."""
