@@ -130,6 +130,9 @@ class BluetoothInterface(Interface):
 
         super().__init__()
 
+        # Set interface mode (required by Transport)
+        self.mode = RNS.Interfaces.Interface.Interface.MODE_FULL
+
         # Set MTU (must be after super().__init__ which sets it to None)
         self.HW_MTU = BluetoothInterface.HW_MTU
 
@@ -169,8 +172,35 @@ class BluetoothInterface(Interface):
         self._scanner = None
         self._server = None
 
+        # Local adapter address (determined at startup)
+        self._local_address = self._get_local_adapter_address()
+        RNS.log(f"{self} local Bluetooth address: {self._local_address}", RNS.LOG_VERBOSE)
+
         # Start the interface
         self._start_interface()
+
+    def _get_local_adapter_address(self):
+        """Get the local Bluetooth adapter's MAC address."""
+        import subprocess
+        try:
+            # Try hciconfig first
+            result = subprocess.run(['hciconfig', 'hci0'], capture_output=True, text=True, timeout=5)
+            if result.returncode == 0:
+                for line in result.stdout.split('\n'):
+                    if 'BD Address:' in line:
+                        return line.split('BD Address:')[1].split()[0].strip()
+
+            # Try bluetoothctl as fallback
+            result = subprocess.run(['bluetoothctl', 'show'], capture_output=True, text=True, timeout=5)
+            if result.returncode == 0:
+                for line in result.stdout.split('\n'):
+                    if 'Address:' in line:
+                        return line.split('Address:')[1].strip()
+
+        except Exception as e:
+            RNS.log(f"Could not determine local Bluetooth address: {e}", RNS.LOG_WARNING)
+
+        return "00:00:00:00:00:00"  # Fallback
 
     def _start_interface(self):
         """Initialize and start BLE operations."""
@@ -344,8 +374,12 @@ class BluetoothInterface(Interface):
     def _add_peer(self, addr, client=None):
         """Add a verified peer."""
         if addr not in self.spawned_interfaces:
+            # Determine if we should initiate connections to this peer
+            # Higher MAC address initiates to avoid collisions
+            should_initiate = self._local_address.upper() > addr.upper()
+
             # Create spawned interface for this peer
-            peer_interface = BluetoothPeer(self, addr)
+            peer_interface = BluetoothPeer(self, addr, should_initiate)
             peer_interface.OUT = self.OUT
             peer_interface.IN = self.IN
             peer_interface.parent_interface = self
@@ -357,7 +391,7 @@ class BluetoothInterface(Interface):
             self.peers[addr] = [time.time(), peer_interface]
 
             RNS.Transport.interfaces.append(peer_interface)
-            RNS.log(f"{self} added peer {addr}", RNS.LOG_DEBUG)
+            RNS.log(f"{self} added peer {addr} (we {'initiate' if should_initiate else 'receive'})", RNS.LOG_DEBUG)
         else:
             # Refresh existing peer
             self.peers[addr][0] = time.time()
@@ -401,6 +435,7 @@ class BluetoothInterface(Interface):
 
     def process_outgoing(self, data):
         """Send data to all connected peers (broadcast)."""
+        RNS.log(f"{self} process_outgoing called with {len(data)} bytes, online={self.online}, peers={len(self.spawned_interfaces)}", RNS.LOG_DEBUG)
         if not self.online:
             return
 
@@ -408,6 +443,7 @@ class BluetoothInterface(Interface):
         framed = bytes([HDLC.FLAG]) + HDLC.escape(data) + bytes([HDLC.FLAG])
 
         for addr, peer in list(self.spawned_interfaces.items()):
+            RNS.log(f"{self} sending to peer {addr}, online={peer.online}", RNS.LOG_DEBUG)
             if peer.online:
                 peer.process_outgoing(framed)
 
@@ -437,7 +473,7 @@ class BluetoothPeer(Interface):
 
     DEFAULT_IFAC_SIZE = 8
 
-    def __init__(self, owner, addr):
+    def __init__(self, owner, addr, should_initiate=True):
         super().__init__()
         self.owner = owner
         self.parent_interface = owner
@@ -445,10 +481,22 @@ class BluetoothPeer(Interface):
         self.name = f"BLE:{addr[-8:]}"  # Short name from MAC
         self.online = False
         self.HW_MTU = owner.HW_MTU
+        self.mode = RNS.Interfaces.Interface.Interface.MODE_FULL
+
+        # Whether we should initiate connections to this peer
+        # (based on MAC address comparison - higher MAC initiates)
+        self._should_initiate = should_initiate
 
         # BLE client for this peer
         self._client = None
         self._connected = False
+        self._connecting = False
+        self._connect_lock = threading.Lock()
+        self._retry_count = 0
+        self._max_retries = 3
+
+        # Outgoing queue for data while connecting
+        self._tx_queue = []
 
         # Receive buffer for HDLC reassembly
         self._rx_buffer = bytearray()
@@ -482,10 +530,20 @@ class BluetoothPeer(Interface):
 
     def process_outgoing(self, data):
         """Send data to this peer."""
+        RNS.log(f"{self} process_outgoing called with {len(data)} bytes, initiate={self._should_initiate}", RNS.LOG_DEBUG)
         if not self.online:
+            RNS.log(f"{self} not online, skipping", RNS.LOG_DEBUG)
+            return
+
+        if not self._should_initiate:
+            # We're not the initiator, can't connect out
+            # Data will be sent when peer connects to us (via notifications)
+            RNS.log(f"{self} not initiator, queuing for notification", RNS.LOG_DEBUG)
+            # For now, just log - will implement notification path later
             return
 
         # Queue async write operation
+        RNS.log(f"{self} queuing write to peer", RNS.LOG_DEBUG)
         asyncio.run_coroutine_threadsafe(
             self._write_to_peer(data),
             self.owner._loop
@@ -493,28 +551,102 @@ class BluetoothPeer(Interface):
 
     async def _write_to_peer(self, data):
         """Async write to peer's TX characteristic."""
+        import random
+        import subprocess
+
+        # If already connecting, queue the data
+        if self._connecting:
+            self._tx_queue.append(data)
+            RNS.log(f"{self} queued data while connecting", RNS.LOG_DEBUG)
+            return
+
         try:
             from bleak import BleakClient
 
             if not self._connected:
-                self._client = BleakClient(self.addr)
-                await self._client.connect()
-                self._connected = True
+                with self._connect_lock:
+                    if self._connected:
+                        pass  # Another thread connected while we waited
+                    elif self._connecting:
+                        self._tx_queue.append(data)
+                        return
+                    else:
+                        self._connecting = True
 
-            # BLE characteristic writes may need chunking
-            # Max ATT payload is typically 512 bytes after MTU negotiation
+                try:
+                    # Stop scanner temporarily - it can interfere with connections
+                    scanner_was_running = False
+                    if self.owner._scanner:
+                        try:
+                            await self.owner._scanner.stop()
+                            scanner_was_running = True
+                            RNS.log(f"{self} stopped scanner for connection", RNS.LOG_DEBUG)
+                        except:
+                            pass
+
+                    # Wait for BlueZ to settle
+                    await asyncio.sleep(0.5 + random.random() * 0.5)
+
+                    RNS.log(f"{self} connecting to peer...", RNS.LOG_DEBUG)
+                    self._client = BleakClient(self.addr, timeout=20.0)
+                    await self._client.connect()
+                    self._connected = True
+                    self._retry_count = 0
+                    RNS.log(f"{self} connected successfully", RNS.LOG_VERBOSE)
+
+                    # Restart scanner
+                    if scanner_was_running:
+                        try:
+                            await self.owner._scanner.start()
+                            RNS.log(f"{self} restarted scanner", RNS.LOG_DEBUG)
+                        except:
+                            pass
+                finally:
+                    self._connecting = False
+
+            # Write the data
             chunk_size = 512
             for i in range(0, len(data), chunk_size):
                 chunk = data[i:i + chunk_size]
-                await self._client.write_gatt_char(RNS_TX_CHARACTERISTIC, chunk)
+                await self._client.write_gatt_char(RNS_TX_CHARACTERISTIC, chunk, response=False)
 
             self.txb += len(data)
             self.owner.txb += len(data)
+            RNS.log(f"{self} wrote {len(data)} bytes", RNS.LOG_DEBUG)
+
+            # Process any queued data
+            while self._tx_queue and self._connected:
+                queued = self._tx_queue.pop(0)
+                for i in range(0, len(queued), chunk_size):
+                    chunk = queued[i:i + chunk_size]
+                    await self._client.write_gatt_char(RNS_TX_CHARACTERISTIC, chunk, response=False)
+                self.txb += len(queued)
+                self.owner.txb += len(queued)
 
         except Exception as e:
             RNS.log(f"{self} write failed: {e}", RNS.LOG_DEBUG)
             self._connected = False
-            self.online = False
+            self._connecting = False
+
+            if self._client:
+                try:
+                    await self._client.disconnect()
+                except:
+                    pass
+                self._client = None
+
+            self._retry_count += 1
+
+            # Only mark offline after max retries
+            if self._retry_count >= self._max_retries:
+                RNS.log(f"{self} max retries exceeded, marking offline", RNS.LOG_WARNING)
+                self.online = False
+            else:
+                # Schedule retry with longer backoff
+                backoff = 2.0 + random.random() * 3.0
+                RNS.log(f"{self} will retry in {backoff:.1f}s (attempt {self._retry_count}/{self._max_retries})", RNS.LOG_DEBUG)
+                await asyncio.sleep(backoff)
+                await self._write_to_peer(data)
 
     def detach(self):
         """Detach this peer interface."""
